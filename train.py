@@ -23,7 +23,7 @@ from utils.parse_args import parse_args
 from augmentations.GPUAug import GPUAug
 
 # Set OMP_NUM_THREADS to avoid warning
-os.environ["OMP_NUM_THREADS"] = "12"
+os.environ["OMP_NUM_THREADS"] = "8"
 
 # Constants
 DEFAULT_NUM_CLASSES = 62
@@ -267,10 +267,10 @@ class EMNISTDataLoader:
 
         train_loader = DataLoader(combined_train_ds, batch_size=self.args.per_gpu_batch, sampler=train_sampler,
                                   num_workers=self.args.num_workers, pin_memory=True, persistent_workers=True,
-                                  drop_last=True, prefetch_factor=8, multiprocessing_context='fork')
+                                  drop_last=True, prefetch_factor=4, multiprocessing_context='fork')
         val_loader = DataLoader(combined_val_ds, batch_size=self.args.per_gpu_batch, sampler=val_sampler,
                                 num_workers=self.args.num_workers, pin_memory=True, persistent_workers=True,
-                                drop_last=False, prefetch_factor=8, multiprocessing_context='fork')
+                                drop_last=False, prefetch_factor=4, multiprocessing_context='fork')
 
         return train_loader, val_loader
 
@@ -305,8 +305,6 @@ class EMNISTDataLoader:
 
 # Training and Evaluation
 class Trainer:
-    """Handles training and evaluation of the MoE model."""
-
     def __init__(self, model, train_loader, val_loader, criterion, optimizer, scheduler, scaler, args):
         self.model = model
         self.train_loader = train_loader
@@ -317,35 +315,33 @@ class Trainer:
         self.scaler = scaler
         self.args = args
 
-        # Initialize augmentations
         self.gpu_aug = GPUAug() if args.gpu_augment else None
 
-        # Initialize EMA
         self.ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
 
-        # Optimize gradient accumulation
         self.optimize_gradient_accumulation()
 
-        if self.args.device.type == 'cuda':
+        if getattr(self.args, "device", None) is not None and self.args.device.type == 'cuda':
             self.optimize_memory()
 
-        # Replace hardcoded value
-        self.swa_start = args.swa_start if hasattr(args, 'swa_start') else int(args.epochs * 0.75)
+        if getattr(args, 'swa_start', None) is not None:
+            self.swa_start = int(args.swa_start)
+        else:
+            self.swa_start = int(max(1, args.epochs * 0.75))
+
         self.swa_scheduler = None
         self.swa_model = None
 
-        if self.args.epochs > self.swa_start:
+        if args.epochs > self.swa_start:
             self.swa_model = AveragedModel(self.model)
             self.swa_scheduler = SWALR(self.optimizer, swa_lr=1e-6)
 
     def train_one_epoch(self, epoch):
-        """Train the model for one epoch with enhanced monitoring and fixes."""
         max_mix = float(self.args.mixup_alpha)
         max_cut = float(self.args.cutmix_alpha)
         warm = int(getattr(self.args, 'aug_warmup_epochs', 2))
         ramp = int(getattr(self.args, 'aug_ramp_epochs', 4))
 
-        # Schedule mixup / cutmix
         if epoch <= warm:
             cur_mix = 0.0
             cur_cut = 0.0
@@ -364,9 +360,9 @@ class Trainer:
         running_cls_loss = 0.0
         n_samples = 0
 
-        use_amp = (self.args.amp and self.args.device.type == 'cuda')
-        use_prefetcher = (not self.args.no_prefetch and self.args.device.type == 'cuda'
-                          and not self.args.use_specialized_moe)
+        use_amp = (self.args.amp and getattr(self.args, "device", None) is not None and self.args.device.type == 'cuda')
+        use_prefetcher = (not self.args.no_prefetch and getattr(self.args, "device", None) is not None
+                          and self.args.device.type == 'cuda' and not self.args.use_specialized_moe)
         prefetcher = None
         if use_prefetcher:
             prefetcher = DataPrefetcher(self.train_loader, self.args.device, use_specialized_moe=False)
@@ -380,15 +376,15 @@ class Trainer:
 
         warmup_epochs = getattr(self.args, "warmup_epochs", 5)
         frac = min(1.0, float(epoch) / max(1.0, warmup_epochs))
-        penalty_weight = float(self.args.penalty_weight) * (0.5 * (1 - math.cos(math.pi * frac)))
+        cos_component = 0.5 * (1 - math.cos(math.pi * frac))
+        penalty_floor = 0.01
+        penalty_weight = float(self.args.penalty_weight) * (penalty_floor + (1.0 - penalty_floor) * cos_component)
 
         penalty_debug = []
-        total_experts = (
-        self.args.num_digit_experts + self.args.num_uppercase_experts + self.args.num_lowercase_experts)
+        total_experts = (self.args.num_digit_experts + self.args.num_uppercase_experts + self.args.num_lowercase_experts)
         expert_usage = torch.zeros(total_experts, device=self.args.device, dtype=torch.long)
 
         while True:
-            # Fetch batch
             if use_prefetcher:
                 batch_x, batch_targets = prefetcher.next()
                 if batch_x is None:
@@ -402,7 +398,6 @@ class Trainer:
 
             it += 1
 
-            # Unpack and move to device
             x = None
             y = None
             lam = 1.0
@@ -432,7 +427,6 @@ class Trainer:
                     x = x.to(self.args.device, non_blocking=True)
                     y = y.to(self.args.device, non_blocking=True)
 
-                    # Scheduled mixup / cutmix decision
                     r = random.random()
                     if r < 0.4 and cur_cut > 0:
                         x, y_pair, lam = GPUAug.cutmix(x, y, alpha=cur_cut)
@@ -446,21 +440,18 @@ class Trainer:
                     print(f"Error unpacking batch at iter {it}: {e}")
                 continue
 
-            # Defensive guard
             if x is None or y is None:
                 if self.args.rank0:
                     print(f"Skipping bad batch at iter {it}: x is None or y is None")
                 continue
 
-            # Ensure channels_last layout
             try:
-                if self.args.device.type == 'cuda' and isinstance(x, torch.Tensor) and x.dim() >= 4:
+                if getattr(self.args, "device", None) is not None and self.args.device.type == 'cuda' and isinstance(x, torch.Tensor) and x.dim() >= 4:
                     x = x.contiguous(memory_format=torch.channels_last)
             except Exception as e:
                 if self.args.rank0:
                     print(f"Warning: failed to convert x to channels_last at iter {it}: {e}")
 
-            # Safe GPU augmentation
             if self.args.gpu_augment and self.gpu_aug is not None:
                 try:
                     aug_x = self.gpu_aug(x)
@@ -468,84 +459,68 @@ class Trainer:
                         raise RuntimeError("GPUAug returned None")
                     if isinstance(aug_x, torch.Tensor) and aug_x.device != x.device:
                         aug_x = aug_x.to(self.args.device)
-                    if self.args.device.type == 'cuda' and isinstance(aug_x, torch.Tensor) and aug_x.dim() >= 4:
+                    if getattr(self.args, "device", None) is not None and self.args.device.type == 'cuda' and isinstance(aug_x, torch.Tensor) and aug_x.dim() >= 4:
                         aug_x = aug_x.contiguous(memory_format=torch.channels_last)
                     x = aug_x
                 except Exception as e:
                     if self.args.rank0:
                         print("ERROR in augmentation:", e)
 
-            # Compute whether this iteration performs an optimizer step
             accum_step = ((it) % int(self.args.accum)) == 0
 
-            # Choose no_sync context correctly
-            if hasattr(self.model, "no_sync") and not accum_step:
-                sync_ctx = self.model.no_sync()
-            else:
-                sync_ctx = nullcontext()
+            sync_ctx = self.get_accum_context(accum_step)
 
-            # Forward + backward inside sync_ctx
             with sync_ctx:
-                with torch.amp.autocast('cuda', enabled=use_amp):  # FIXED: Use torch.amp.autocast
+                with torch.amp.autocast('cuda', enabled=use_amp):
                     combined_output, penalty = self.model(x)
                     out = combined_output
 
-                    # Calculate classification loss
                     if not self.args.use_specialized_moe and lam != 1.0:
                         cls_loss = mixup_criterion(self.criterion, out, y_pair, lam)
                     else:
                         cls_loss = self.criterion(out, y)
 
-                    # Enhanced penalty handling with warmup
-                    penalty_value = penalty if isinstance(penalty, torch.Tensor) else torch.tensor(penalty,
-                                                                                                   device=x.device)
+                    penalty_value = penalty if isinstance(penalty, torch.Tensor) else torch.tensor(penalty, device=x.device)
                     penalty_debug.append(penalty_value.detach().cpu().item())
 
                     total_loss = cls_loss + penalty_weight * penalty_value
                     loss_for_backward = total_loss / float(self.args.accum)
 
-                # Log values (detached)
                 with torch.no_grad():
                     batch_bs = x.size(0)
                     loss_log_val = total_loss.detach().cpu().item()
                     penalty_log_val = penalty_value.detach().cpu().item()
                     cls_loss_val = cls_loss.detach().cpu().item()
 
-                # Backward with GradScaler
                 self.scaler.scale(loss_for_backward).backward()
 
-            # Expert usage monitoring (every 50 steps)
             if it % 50 == 0:
                 with torch.no_grad():
                     gate_output = self.model.gate(x)
                     top_experts = gate_output.argmax(dim=1)
                     for idx in top_experts:
-                        expert_usage[idx] += 1
+                        if idx < expert_usage.numel():
+                            expert_usage[idx] += 1
 
-            # If it's time to step, unscale/clip/step/update/zero_grad/EMA
             if accum_step:
-                # Gradient clipping
                 if hasattr(self.scaler, "unscale_"):
                     try:
                         self.scaler.unscale_(self.optimizer)
                     except Exception:
                         pass
 
-                # Gradient clipping with error checking
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.args.grad_clip,
-                    error_if_nonfinite=False  # Catch NaN gradients
+                    error_if_nonfinite=False
                 )
 
-                # Optimizer step
                 try:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 except Exception as e:
                     if self.args.rank0:
                         print("Optimizer step under scaler failed:", e)
-                    # Fallback to plain step
                     try:
                         self.optimizer.step()
                     except Exception as e2:
@@ -559,39 +534,33 @@ class Trainer:
                 try:
                     from torch.optim.lr_scheduler import OneCycleLR
                     if isinstance(self.scheduler, OneCycleLR):
-                        # step after optimizer update (per actual parameter update)
                         try:
                             self.scheduler.step()
                         except Exception as e:
                             if self.args.rank0:
                                 print("Warning: per-step scheduler.step() failed:", e)
                 except Exception:
-                    # ignore if import fails
                     pass
 
                 self.optimizer.zero_grad(set_to_none=True)
 
-                # EMA update only after optimizer step
                 if self.ema is not None:
                     try:
                         self.ema.update(self.model)
                     except Exception:
                         pass
 
-            # Accumulate running stats
             running_loss += loss_log_val * batch_bs
             running_penalty += penalty_log_val * batch_bs
             running_cls_loss += cls_loss_val * batch_bs
             n_samples += batch_bs
 
-            # Enhanced progress bar with more metrics
             if self.args.rank0:
                 avg_loss = running_loss / n_samples if n_samples > 0 else 0.0
                 avg_pen = running_penalty / n_samples if n_samples > 0 else 0.0
                 avg_cls = running_cls_loss / n_samples if n_samples > 0 else 0.0
                 lr = self.optimizer.param_groups[0]['lr']
 
-                # Expert usage percentage (every 100 steps)
                 expert_info = ""
                 if it % 100 == 0 and expert_usage.sum() > 0:
                     expert_pct = (expert_usage / expert_usage.sum() * 100).cpu().numpy()
@@ -605,20 +574,17 @@ class Trainer:
                     lr=f"{lr:.2e}{expert_info}"
                 )
 
-            # Print detailed penalty info every 100 steps
             if it % 100 == 0 and self.args.rank0 and len(penalty_debug) > 0:
                 avg_penalty = sum(penalty_debug) / len(penalty_debug)
                 min_penalty = min(penalty_debug)
                 max_penalty = max(penalty_debug)
-                print(
-                    f"Step {it}: Penalty - avg={avg_penalty:.6f}, min={min_penalty:.6f}, max={max_penalty:.6f}, weight={penalty_weight:.1f}")
-                penalty_debug = []  # Reset debug buffer
+                print(f"Step {it}: Penalty - avg={avg_penalty:.6f}, min={min_penalty:.6f}, max={max_penalty:.6f}, weight={penalty_weight:.4f}")
+                penalty_debug = []
 
             pbar.update(1)
 
         pbar.close()
 
-        # Final epoch statistics
         avg_loss = running_loss / n_samples if n_samples > 0 else 0.0
         avg_penalty = running_penalty / n_samples if n_samples > 0 else 0.0
         avg_cls_loss = running_cls_loss / n_samples if n_samples > 0 else 0.0
