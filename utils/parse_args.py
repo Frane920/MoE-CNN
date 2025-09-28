@@ -46,9 +46,9 @@ def parse_args():
                    help='Use specialized MoE with unknown class filtering')
     p.add_argument('--unknown_threshold', type=float, default=0.3,
                    help='Filter out experts with unknown confidence higher than threshold')
-    p.add_argument('--aug_warmup_epochs', type=int, default=2,
+    p.add_argument('--aug_warmup_epochs', type=int, default=3,
                    help='Number of epochs for which mixup/cutmix are disabled')
-    p.add_argument('--aug_ramp_epochs', type=int, default=4,
+    p.add_argument('--aug_ramp_epochs', type=int, default=6,
                    help='Number of epochs over which to linearly increase mixup/cutmix to their max')
 
     return p.parse_args()

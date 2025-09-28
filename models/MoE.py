@@ -70,7 +70,21 @@ class MoE(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.unknown_threshold = unknown_threshold
 
-    def _run_experts(self, experts, x):
+        self._init_weights()
+
+    def _init_weights(self):
+        """Proper weight initialization"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+   def _run_experts(self, experts, x):
         """Run list of experts, return stacked logits: [B, E, C]"""
         # Ensure channels_last for conv performance on CUDA
         x = x.contiguous(memory_format=torch.channels_last)

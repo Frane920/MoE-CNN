@@ -962,6 +962,50 @@ def create_training_components(model, args, train_loader=None):
 
     return criterion, optimizer, scheduler, scaler
 
+
+def create_training_components(model, args, train_loader=None):
+    """Create criterion, optimizer, scheduler, and scaler."""
+    # criterion
+    if args.use_focal:
+        criterion = FocalLoss(gamma=1.5).to(args.device)
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(args.device)
+
+    # Better LR scaling for Lion optimizer
+    effective_batch_size = args.per_gpu_batch * args.accum * (args.world_size if args.distributed else 1)
+
+    # For Lion optimizer, use linear scaling (not sqrt) and slightly higher base LR
+    base_lr = args.lr
+    scaled_lr = base_lr * (effective_batch_size / 256.0)
+
+    # Keep Lion optimizer but with better LR
+    optimizer = Lion(
+        model.parameters(),
+        lr=scaled_lr,
+        weight_decay=args.weight_decay
+    )
+
+    if args.rank0:
+        print(f"Effective batch size: {effective_batch_size}, Base LR: {base_lr:.2e}, Scaled LR: {scaled_lr:.2e}")
+
+    # Use CosineAnnealingWarmRestarts for better convergence with Lion
+    if train_loader is not None:
+        # Cosine annealing with warm restarts - works well with Lion
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=20,  # Restart every 20 epochs
+            T_mult=2,  # Double the cycle length each time
+            eta_min=scaled_lr * 0.01  # Minimum LR is 1% of scaled LR
+        )
+    else:
+        # Fallback
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
+
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+
+    return criterion, optimizer, scheduler, scaler
+
+
 def main():
     args = parse_args()
     device, local_rank = setup_distributed_environment(args)
@@ -986,54 +1030,59 @@ def main():
     # Debug prints: scheduler type & initial LR
     if args.rank0:
         print("Scheduler type:", type(scheduler).__name__)
-        try:
-            print("Initial LR:", optimizer.param_groups[0]["lr"])
-        except Exception:
-            pass
+        print("Initial LR:", optimizer.param_groups[0]["lr"])
+        print("Optimizer:", type(optimizer).__name__)
 
     best_acc, start_epoch = load_checkpoint_if_exists(model, optimizer, scheduler, scaler, args)
 
-    # If we resumed from checkpoint and the scheduler is OneCycleLR, print some internals to sanity-check
-    if args.rank0:
-        try:
-            from torch.optim.lr_scheduler import OneCycleLR
-            if isinstance(scheduler, OneCycleLR):
-                print("Resumed OneCycleLR state keys:", list(scheduler.state_dict().keys()))
-                # Print current LR after load (helps verify scheduler restoration)
-                print("LR after resume:", optimizer.param_groups[0]["lr"])
-        except Exception:
-            pass
+    # Reset best_acc if starting fresh to track improvements properly
+    if start_epoch == 0:
+        best_acc = 0.0
 
     trainer = Trainer(model, train_loader, val_loader, criterion, optimizer, scheduler, scaler, args)
 
     trainer.warmup_model()
 
-    # If scheduler is OneCycleLR we will let Trainer.step it per-optimizer-step.
-    from torch.optim.lr_scheduler import OneCycleLR
-    scheduler_is_iter = isinstance(scheduler, OneCycleLR)
+    # Training metrics tracking
+    max_patience = 15
+    patience = 0
+    best_acc = best_acc  # This might be loaded from checkpoint
 
     for epoch in range(start_epoch, args.epochs + 1):
         if args.distributed and dist.is_initialized():
-            # ensure DistributedSampler shuffles differently each epoch
             train_loader.sampler.set_epoch(epoch)
 
         train_loss, train_penalty = trainer.train_one_epoch(epoch)
 
-        # Step epoch-level scheduler only if it's NOT an iter scheduler like OneCycleLR
-        if not scheduler_is_iter:
-            try:
-                scheduler.step()
-            except Exception as e:
-                if args.rank0:
-                    print("Warning: epoch-level scheduler.step() failed:", e)
+        # Step the scheduler (CosineAnnealingWarmRestarts steps at epoch end)
+        try:
+            scheduler.step()
+        except Exception as e:
+            if args.rank0:
+                print("Warning: scheduler.step() failed:", e)
 
         val_loss, val_acc = trainer.validate(tta=False, epoch=epoch)
 
         if args.rank0:
-            print(
-                f"[E{epoch:03d}] train_loss={train_loss:.4f} train_penalty={train_penalty:.4f} val_loss={val_loss:.4f} acc={val_acc:.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"[E{epoch:03d}] train_loss={train_loss:.4f} train_penalty={train_penalty:.4f} "
+                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} lr={current_lr:.2e}")
 
             is_best = val_acc > best_acc
+            if is_best:
+                best_acc = val_acc
+                patience = 0
+                if args.rank0:
+                    print(f"🎯 New best accuracy: {best_acc:.3f}%")
+            else:
+                patience += 1
+                if args.rank0:
+                    print(f"⏳ No improvement for {patience} epochs (best: {best_acc:.3f}%)")
+
+            if patience >= max_patience:
+                if args.rank0:
+                    print(f"🛑 Early stopping at epoch {epoch} - no improvement for {max_patience} epochs")
+                break
 
             # Create checkpoint state
             checkpoint = {
@@ -1042,31 +1091,76 @@ def main():
                 'best_acc': best_acc,
                 'model_state_dict': (model.module.state_dict() if hasattr(model, "module") else model.state_dict()),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict() if hasattr(scheduler, "state_dict") else None,
+                'scheduler_state_dict': scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict() if scaler else None,
                 'args': vars(args)
             }
 
-            # Save best and latest - be robust about directories
+            # Save checkpoints
             try:
-                if is_best:
-                    save_checkpoint(checkpoint, str(Path(args.save).with_name("best_model.pt")))
-                save_checkpoint(checkpoint, str(Path(args.save).with_name("latest_model.pt")))
-            except Exception as e:
-                print("Warning: failed to save checkpoint:", e)
+                os.makedirs(os.path.dirname(args.save) if os.path.dirname(args.save) else ".", exist_ok=True)
 
-    # If using EMA copy to model before final save
-    if trainer.ema is not None and args.rank0:
-        trainer.ema.copy_to_model(model if not hasattr(model, 'module') else model.module)
+                if is_best:
+                    best_path = str(Path(args.save).with_name("best_model.pt"))
+                    save_checkpoint(checkpoint, best_path)
+                    if args.rank0:
+                        print(f"💾 Saved best model to {best_path}")
+
+                latest_path = str(Path(args.save).with_name("latest_model.pt"))
+                save_checkpoint(checkpoint, latest_path)
+
+            except Exception as e:
+                if args.rank0:
+                    print("Warning: failed to save checkpoint:", e)
+
+        # SWA update if enabled and past SWA start epoch
+        if hasattr(trainer, 'swa_model') and trainer.swa_model is not None and epoch >= trainer.swa_start:
+            trainer.swa_model.update_parameters(model)
+            if hasattr(trainer, 'swa_scheduler'):
+                trainer.swa_scheduler.step()
+
+    # Final SWA and EMA updates
+    if args.rank0:
+        if hasattr(trainer, 'swa_model') and trainer.swa_model is not None:
+            print("Applying SWA...")
+            # Update batch norm statistics for SWA
+            torch.optim.swa_utils.update_bn(train_loader, trainer.swa_model, device=args.device)
+            final_model = trainer.swa_model
+        elif trainer.ema is not None:
+            print("Applying EMA...")
+            trainer.ema.copy_to_model(model if not hasattr(model, 'module') else model.module)
+            final_model = model
+        else:
+            final_model = model
+
+        # Save final model
         final_state = {
-            "model_state_dict": (model.module.state_dict() if hasattr(model, "module") else model.state_dict()),
-            "args": vars(args)
+            "model_state_dict": (
+                final_model.module.state_dict() if hasattr(final_model, "module") else final_model.state_dict()),
+            "args": vars(args),
+            "final_accuracy": best_acc
         }
-        save_checkpoint(final_state, str(Path(args.save).with_name("final_model.pt")))
+        try:
+            final_path = str(Path(args.save).with_name("final_model.pt"))
+            save_checkpoint(final_state, final_path)
+            print(f"💾 Saved final model to {final_path}")
+
+            # Also save as safetensors if requested
+            if args.export_safetensors:
+                from utils.checkpoint import save_safetensors
+                safetensors_path = str(Path(args.save).with_name("final_model.safetensors"))
+                save_safetensors(final_model, safetensors_path)
+                print(f"💾 Saved final model as safetensors to {safetensors_path}")
+
+        except Exception as e:
+            print("Warning: failed to save final model:", e)
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
