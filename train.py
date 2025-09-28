@@ -11,7 +11,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from lion_pytorch import Lion
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingWarmRestarts
+from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torchvision import datasets
 from tqdm import tqdm
@@ -327,6 +328,14 @@ class Trainer:
 
         if self.args.device.type == 'cuda':
             self.optimize_memory()
+
+        self.swa_start = 100  # Start SWA after 100 epochs
+        self.swa_scheduler = None
+        self.swa_model = None
+
+        if self.args.epochs > self.swa_start:
+            self.swa_model = AveragedModel(self.model)
+            self.swa_scheduler = SWALR(self.optimizer, swa_lr=1e-6)
 
     def train_one_epoch(self, epoch):
         """Train the model for one epoch with enhanced monitoring and fixes."""
@@ -932,6 +941,25 @@ def create_training_components(model, args, train_loader=None):
 
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
+    if train_loader is not None:
+        total_steps = len(train_loader) * args.epochs
+        warmup_steps = len(train_loader) * args.warmup_epochs
+
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                # Linear warmup
+                return float(current_step) / float(max(1, warmup_steps))
+            else:
+                # Cosine annealing with restarts every 30 epochs
+                progress = (current_step - warmup_steps) % (len(train_loader) * 30)
+                total_cycle_steps = len(train_loader) * 30
+                return 0.5 * (1.0 + math.cos(math.pi * progress / total_cycle_steps))
+
+        scheduler = LambdaLR(optimizer, lr_lambda)
+    else:
+        # Fallback
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
+
     return criterion, optimizer, scheduler, scaler
 
 def main():
@@ -980,9 +1008,6 @@ def main():
 
     trainer.warmup_model()
 
-    max_patience = 15
-    patience = 0
-
     # If scheduler is OneCycleLR we will let Trainer.step it per-optimizer-step.
     from torch.optim.lr_scheduler import OneCycleLR
     scheduler_is_iter = isinstance(scheduler, OneCycleLR)
@@ -1009,14 +1034,6 @@ def main():
                 f"[E{epoch:03d}] train_loss={train_loss:.4f} train_penalty={train_penalty:.4f} val_loss={val_loss:.4f} acc={val_acc:.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
 
             is_best = val_acc > best_acc
-            if is_best:
-                best_acc = val_acc
-                patience = 0
-            else:
-                patience += 1
-                if patience >= max_patience:
-                    print(f"Early stopping at epoch {epoch} - no improvement for {max_patience} epochs")
-                    break
 
             # Create checkpoint state
             checkpoint = {

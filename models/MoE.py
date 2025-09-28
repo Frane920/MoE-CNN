@@ -43,35 +43,22 @@ class MoE(nn.Module):
         # Shared gating trunk
         self.gate_shared = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(64, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.Dropout(0.3)  # Increased dropout
         )
-        # Per-specialization gating heads
-        self.gate_digit = nn.Linear(128, num_digit_experts)
-        self.gate_upper = nn.Linear(128, num_uppercase_experts)
-        self.gate_lower = nn.Linear(128, num_lowercase_experts)
-
-        # Temperature for gating (learnable)
-        self.gate_temp = nn.Parameter(torch.tensor(1.0))
-
-        # Learnable unknown_scale (how strongly unknown-probs subtract from logits)
-        self.unknown_scale = nn.Parameter(torch.tensor(2.0))
-
-        # bookkeeping
-        self.num_digit_experts = num_digit_experts
-        self.num_uppercase_experts = num_uppercase_experts
-        self.num_lowercase_experts = num_lowercase_experts
-        self.total_experts = num_digit_experts + num_uppercase_experts + num_lowercase_experts
-        self.k = k_per_specialization
-        self.gradient_checkpointing = gradient_checkpointing
-        self.unknown_threshold = unknown_threshold
+        self.digit_temp = nn.Parameter(torch.tensor(1.0))
+        self.upper_temp = nn.Parameter(torch.tensor(1.0))
+        self.lower_temp = nn.Parameter(torch.tensor(1.0))
 
     def _run_experts(self, experts, x):
         """Run list of experts, return stacked logits: [B, E, C]"""
@@ -94,22 +81,22 @@ class MoE(nn.Module):
           - total_penalty: scalar tensor (trainer multiplies by penalty_weight)
         """
         B = x.size(0)
-
-        # Gate shared trunk (disable autocast for determinism/stability)
         with torch.amp.autocast('cuda', enabled=False):
-            shared = self.gate_shared(x).float()  # [B, 128]
+            shared = self.gate_shared(x).float()
 
-        # compute raw logits per-specialization
-        d_logits = self.gate_digit(shared)  # [B, Dexp]
-        u_logits = self.gate_upper(shared)  # [B, Uexp]
-        l_logits = self.gate_lower(shared)  # [B, Lexp]
+        d_logits = self.gate_digit(shared)
+        u_logits = self.gate_upper(shared)
+        l_logits = self.gate_lower(shared)
 
-        # apply temperature (clamped as 0-dim tensor, no .item())
-        temp = torch.clamp(self.gate_temp, min=0.1, max=10.0)  # tensor scalar
+        temp = torch.clamp(self.gate_temp, min=0.1, max=10.0)
         if temp != 1.0:
             d_logits = d_logits / temp
             u_logits = u_logits / temp
             l_logits = l_logits / temp
+
+        d_logits = d_logits / torch.clamp(self.digit_temp, min=0.1, max=10.0)
+        u_logits = u_logits / torch.clamp(self.upper_temp, min=0.1, max=10.0)
+        l_logits = l_logits / torch.clamp(self.lower_temp, min=0.1, max=10.0)
 
         # ---- Run experts (logits) ----
         digit_outputs = self._run_experts(self.digit_experts, x)        # [B, Dexp, NUM_DIGITS+1]
