@@ -6,6 +6,7 @@ bestmodel.pt/
 bestmodel.pt/best_model.pt
 best_model.pt
 model.pt
+txt
 *.pt
 *.pt/
 model.pt/
