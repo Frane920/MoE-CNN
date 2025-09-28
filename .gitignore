@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.idea/
+bestmodel.pt/
+bestmodel.pt/best_model.pt
+best_model.pt
+model.pt
+*.pt
+*.pt/
+model.pt/
+data/
