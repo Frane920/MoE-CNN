@@ -11,16 +11,6 @@ from models.experts.UppercaseLetterCNN import UppercaseCNN, NUM_UPPERCASE
 
 
 class MoE(nn.Module):
-    """
-    Specialized Hierarchical Mixture of Experts with Unknown Class Filtering.
-
-    Changes / guarantees:
-      - No .item() calls in forward/gate (torch.compile / torch.dynamo friendly).
-      - Added .gate(x) method returning concatenated gate logits [B, total_experts].
-      - Stable clamping via 0-dim tensors (broadcastable).
-      - Forward returns (combined_output, total_penalty) where trainer multiplies penalty_weight.
-    """
-
     def __init__(self, num_digit_experts=2, num_uppercase_experts=2, num_lowercase_experts=2,
                  use_batchnorm=False, channel_mult=0.5, k_per_specialization=2, gradient_checkpointing=True,
                  unknown_threshold=0.3):
@@ -56,9 +46,29 @@ class MoE(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.3)  # Increased dropout
         )
+
+        # ADD THE MISSING GATE HEADS
+        self.gate_digit = nn.Linear(128, num_digit_experts)
+        self.gate_upper = nn.Linear(128, num_uppercase_experts)
+        self.gate_lower = nn.Linear(128, num_lowercase_experts)
+
+        # Temperature parameters
+        self.gate_temp = nn.Parameter(torch.tensor(1.0))
         self.digit_temp = nn.Parameter(torch.tensor(1.0))
         self.upper_temp = nn.Parameter(torch.tensor(1.0))
         self.lower_temp = nn.Parameter(torch.tensor(1.0))
+
+        # Unknown scale parameter
+        self.unknown_scale = nn.Parameter(torch.tensor(2.0))
+
+        # Bookkeeping
+        self.num_digit_experts = num_digit_experts
+        self.num_uppercase_experts = num_uppercase_experts
+        self.num_lowercase_experts = num_lowercase_experts
+        self.total_experts = num_digit_experts + num_uppercase_experts + num_lowercase_experts
+        self.k = k_per_specialization
+        self.gradient_checkpointing = gradient_checkpointing
+        self.unknown_threshold = unknown_threshold
 
     def _run_experts(self, experts, x):
         """Run list of experts, return stacked logits: [B, E, C]"""
