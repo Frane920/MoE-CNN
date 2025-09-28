@@ -84,7 +84,7 @@ class MoE(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-   def _run_experts(self, experts, x):
+    def _run_experts(self, experts, x):
         """Run list of experts, return stacked logits: [B, E, C]"""
         # Ensure channels_last for conv performance on CUDA
         x = x.contiguous(memory_format=torch.channels_last)

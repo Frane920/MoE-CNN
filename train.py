@@ -890,78 +890,6 @@ def create_model(args, device):
 
     return model
 
-def create_training_components(model, args, train_loader=None):
-    """Create criterion, optimizer, scheduler, and scaler."""
-    # criterion
-    if args.use_focal:
-        criterion = FocalLoss(gamma=1.5).to(args.device)
-    else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(args.device)
-
-    effective_batch_size = args.per_gpu_batch * args.accum * (args.world_size if args.distributed else 1)
-    base_lr = args.lr
-    scaled_lr = base_lr * math.sqrt(effective_batch_size / 64)
-
-    optimizer = Lion(
-        model.parameters(),
-        lr=scaled_lr,
-        weight_decay=args.weight_decay
-    )
-
-    if args.rank0:
-        print(f"Effective batch size: {effective_batch_size}, Scaled LR: {scaled_lr:.2e}")
-
-    # Choose scheduler based on available information
-    if train_loader is not None:
-        # Use OneCycleLR if we have the train_loader
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=scaled_lr * 3,
-            epochs=args.epochs,
-            steps_per_epoch=len(train_loader),
-            pct_start=0.1,
-            div_factor=10.0,
-            final_div_factor=100.0
-        )
-        if args.rank0:
-            print(f"Using OneCycleLR with {len(train_loader)} steps per epoch")
-    else:
-        # Fallback to LambdaLR if no train_loader available
-        def lr_lambda(epoch):
-            if epoch < args.warmup_epochs:
-                return float(epoch) / float(max(1, args.warmup_epochs))
-            else:
-                # Cosine annealing with restarts every 30 epochs
-                progress = (epoch - args.warmup_epochs) % 30
-                return 0.5 * (1 + math.cos(math.pi * progress / 30))
-
-        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-        if args.rank0:
-            print("Using LambdaLR (cosine annealing with restarts)")
-
-    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
-
-    if train_loader is not None:
-        total_steps = len(train_loader) * args.epochs
-        warmup_steps = len(train_loader) * args.warmup_epochs
-
-        def lr_lambda(current_step):
-            if current_step < warmup_steps:
-                # Linear warmup
-                return float(current_step) / float(max(1, warmup_steps))
-            else:
-                # Cosine annealing with restarts every 30 epochs
-                progress = (current_step - warmup_steps) % (len(train_loader) * 30)
-                total_cycle_steps = len(train_loader) * 30
-                return 0.5 * (1.0 + math.cos(math.pi * progress / total_cycle_steps))
-
-        scheduler = LambdaLR(optimizer, lr_lambda)
-    else:
-        # Fallback
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
-
-    return criterion, optimizer, scheduler, scaler
-
 
 def create_training_components(model, args, train_loader=None):
     """Create criterion, optimizer, scheduler, and scaler."""
@@ -1073,7 +1001,7 @@ def main():
                 best_acc = val_acc
                 patience = 0
                 if args.rank0:
-                    print(f"🎯 New best accuracy: {best_acc:.3f}%")
+                    print(f"New best accuracy: {best_acc:.3f}%")
             else:
                 patience += 1
                 if args.rank0:
@@ -1081,7 +1009,7 @@ def main():
 
             if patience >= max_patience:
                 if args.rank0:
-                    print(f"🛑 Early stopping at epoch {epoch} - no improvement for {max_patience} epochs")
+                    print(f"Early stopping at epoch {epoch} - no improvement for {max_patience} epochs")
                 break
 
             # Create checkpoint state
@@ -1104,7 +1032,7 @@ def main():
                     best_path = str(Path(args.save).with_name("best_model.pt"))
                     save_checkpoint(checkpoint, best_path)
                     if args.rank0:
-                        print(f"💾 Saved best model to {best_path}")
+                        print(f"Saved best model to {best_path}")
 
                 latest_path = str(Path(args.save).with_name("latest_model.pt"))
                 save_checkpoint(checkpoint, latest_path)
@@ -1143,14 +1071,14 @@ def main():
         try:
             final_path = str(Path(args.save).with_name("final_model.pt"))
             save_checkpoint(final_state, final_path)
-            print(f"💾 Saved final model to {final_path}")
+            print(f"Saved final model to {final_path}")
 
             # Also save as safetensors if requested
             if args.export_safetensors:
                 from utils.checkpoint import save_safetensors
                 safetensors_path = str(Path(args.save).with_name("final_model.safetensors"))
                 save_safetensors(final_model, safetensors_path)
-                print(f"💾 Saved final model as safetensors to {safetensors_path}")
+                print(f"Saved final model as safetensors to {safetensors_path}")
 
         except Exception as e:
             print("Warning: failed to save final model:", e)
@@ -1158,9 +1086,6 @@ def main():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
