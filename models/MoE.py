@@ -12,8 +12,8 @@ from models.experts.UppercaseLetterCNN import UppercaseCNN, NUM_UPPERCASE
 
 class MoE(nn.Module):
     def __init__(self, num_digit_experts=2, num_uppercase_experts=2, num_lowercase_experts=2,
-                 use_batchnorm=False, channel_mult=0.5, k_per_specialization=2, gradient_checkpointing=True,
-                 unknown_threshold=0.3):
+                 use_batchnorm=False, channel_mult=0.5, k_per_specialization=2,
+                 gradient_checkpointing=True, unknown_threshold=0.3):
         super().__init__()
 
         # Experts
@@ -33,26 +33,26 @@ class MoE(nn.Module):
         # Shared gating trunk
         self.gate_shared = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
+            nn.GroupNorm(4, 32),
+            nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(64, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.3)  # Increased dropout
+            nn.LayerNorm(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3)
         )
 
-        # ADD THE MISSING GATE HEADS
+        # Gate heads
         self.gate_digit = nn.Linear(128, num_digit_experts)
         self.gate_upper = nn.Linear(128, num_uppercase_experts)
         self.gate_lower = nn.Linear(128, num_lowercase_experts)
 
-        # Temperature parameters
+        # Temperatures
         self.gate_temp = nn.Parameter(torch.tensor(1.0))
         self.digit_temp = nn.Parameter(torch.tensor(1.0))
         self.upper_temp = nn.Parameter(torch.tensor(1.0))
@@ -73,72 +73,59 @@ class MoE(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Proper weight initialization"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.GroupNorm) or isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def _run_experts(self, experts, x):
-        """Run list of experts, return stacked logits: [B, E, C]"""
-        # Ensure channels_last for conv performance on CUDA
         x = x.contiguous(memory_format=torch.channels_last)
-
         if self.gradient_checkpointing and self.training:
-            def run_all(x):
-                return torch.stack([expert(x) for expert in experts], dim=1)
-
-            # checkpoint reduces memory but requires grad; it's OK in normal forward
+            def run_all(inp):
+                return torch.stack([expert(inp) for expert in experts], dim=1)
             return checkpoint(run_all, x, use_reentrant=False)
         else:
             return torch.stack([expert(x) for expert in experts], dim=1)
 
     def forward(self, x):
-        """
-        Forward returns:
-          - combined_output: [B, NUM_DIGITS + NUM_UPPERCASE + NUM_LOWERCASE]
-          - total_penalty: scalar tensor (trainer multiplies by penalty_weight)
-        """
         B = x.size(0)
-        with torch.amp.autocast('cuda', enabled=False):
-            shared = self.gate_shared(x).float()
+        with torch.cuda.amp.autocast(enabled=True):
+            shared = self.gate_shared(x)
 
         d_logits = self.gate_digit(shared)
         u_logits = self.gate_upper(shared)
         l_logits = self.gate_lower(shared)
 
+        # Apply temperatures
         temp = torch.clamp(self.gate_temp, min=0.1, max=10.0)
-        if temp != 1.0:
-            d_logits = d_logits / temp
-            u_logits = u_logits / temp
-            l_logits = l_logits / temp
+        d_logits = d_logits / temp / torch.clamp(self.digit_temp, min=0.1, max=10.0)
+        u_logits = u_logits / temp / torch.clamp(self.upper_temp, min=0.1, max=10.0)
+        l_logits = l_logits / temp / torch.clamp(self.lower_temp, min=0.1, max=10.0)
 
-        d_logits = d_logits / torch.clamp(self.digit_temp, min=0.1, max=10.0)
-        u_logits = u_logits / torch.clamp(self.upper_temp, min=0.1, max=10.0)
-        l_logits = l_logits / torch.clamp(self.lower_temp, min=0.1, max=10.0)
+        # Run experts
+        digit_outputs = self._run_experts(self.digit_experts, x)
+        uppercase_outputs = self._run_experts(self.uppercase_experts, x)
+        lowercase_outputs = self._run_experts(self.lowercase_experts, x)
 
-        # ---- Run experts (logits) ----
-        digit_outputs = self._run_experts(self.digit_experts, x)        # [B, Dexp, NUM_DIGITS+1]
-        uppercase_outputs = self._run_experts(self.uppercase_experts, x)  # [B, Uexp, NUM_UPPERCASE+1]
-        lowercase_outputs = self._run_experts(self.lowercase_experts, x)  # [B, Lexp, NUM_LOWERCASE+1]
+        # Unknown class probabilities
+        digit_unknown_probs = F.softmax(digit_outputs, dim=-1)[..., -1].detach()
+        uppercase_unknown_probs = F.softmax(uppercase_outputs, dim=-1)[..., -1].detach()
+        lowercase_unknown_probs = F.softmax(lowercase_outputs, dim=-1)[..., -1].detach()
 
-        # ---- Unknown probs for each expert (prob on unknown class) ----
-        digit_unknown_probs = F.softmax(digit_outputs, dim=-1)[..., -1]        # [B, Dexp]
-        uppercase_unknown_probs = F.softmax(uppercase_outputs, dim=-1)[..., -1]  # [B, Uexp]
-        lowercase_unknown_probs = F.softmax(lowercase_outputs, dim=-1)[..., -1]  # [B, Lexp]
-
-        # ---- Confidence-weighted gating: subtract unknown * scale from logits ----
-        scale = torch.clamp(self.unknown_scale, min=0.0, max=50.0)  # tensor scalar
+        # Adjust logits by unknown probs
+        scale = torch.clamp(self.unknown_scale, min=0.0, max=50.0)
         d_logits_adj = d_logits - digit_unknown_probs * scale
         u_logits_adj = u_logits - uppercase_unknown_probs * scale
         l_logits_adj = l_logits - lowercase_unknown_probs * scale
 
-        # ---- top-k routing per group ----
         kd = min(self.k, self.num_digit_experts)
         ku = min(self.k, self.num_uppercase_experts)
         kl = min(self.k, self.num_lowercase_experts)
@@ -147,8 +134,7 @@ class MoE(nn.Module):
         u_topv, u_idx = u_logits_adj.topk(k=ku, dim=1)
         l_topv, l_idx = l_logits_adj.topk(k=kl, dim=1)
 
-        neg_inf = -1e4 if d_logits_adj.dtype == torch.float16 else -1e9
-
+        neg_inf = -1e9
         d_masked_logits = torch.full_like(d_logits_adj, neg_inf)
         u_masked_logits = torch.full_like(u_logits_adj, neg_inf)
         l_masked_logits = torch.full_like(l_logits_adj, neg_inf)
@@ -157,75 +143,31 @@ class MoE(nn.Module):
         u_masked_logits.scatter_(1, u_idx, u_topv)
         l_masked_logits.scatter_(1, l_idx, l_topv)
 
-        d_norm = F.softmax(d_masked_logits, dim=1)  # [B, Dexp]
-        u_norm = F.softmax(u_masked_logits, dim=1)  # [B, Uexp]
-        l_norm = F.softmax(l_masked_logits, dim=1)  # [B, Lexp]
+        d_norm = F.softmax(d_masked_logits, dim=1)
+        u_norm = F.softmax(u_masked_logits, dim=1)
+        l_norm = F.softmax(l_masked_logits, dim=1)
 
-        # ---- Combine expert outputs (exclude unknown class logits) ----
         d_combined = torch.einsum('be,bec->bc', d_norm, digit_outputs[..., :NUM_DIGITS])
         u_combined = torch.einsum('be,bec->bc', u_norm, uppercase_outputs[..., :NUM_UPPERCASE])
         l_combined = torch.einsum('be,bec->bc', l_norm, lowercase_outputs[..., :NUM_LOWERCASE])
 
-        combined_output = torch.cat([d_combined, u_combined, l_combined], dim=1)  # [B, total_classes]
+        combined_output = torch.cat([d_combined, u_combined, l_combined], dim=1)
 
-        # ---- Penalty term (encourage experts not to spam unknown) ----
-        digit_penalty = digit_unknown_probs.max(dim=1)[0]      # [B]
+        # penalty (not detached so gradient flows here)
+        digit_penalty = digit_unknown_probs.max(dim=1)[0]
         uppercase_penalty = uppercase_unknown_probs.max(dim=1)[0]
         lowercase_penalty = lowercase_unknown_probs.max(dim=1)[0]
-
         penalty_per_sample = (digit_penalty + uppercase_penalty + lowercase_penalty) / 3.0
-        total_penalty = penalty_per_sample.mean()  # scalar tensor
+        total_penalty = penalty_per_sample.mean()
 
         return combined_output, total_penalty
 
     def gate(self, x):
-        """
-        Return concatenated raw gate logits for monitoring:
-            [B, num_digit_experts + num_uppercase_experts + num_lowercase_experts]
-
-        Note: this returns *raw* logits (optionally you can post-process),
-        but it's exactly what your training monitor expects for argmax.
-        """
-        # compute shared trunk (disable autocast like forward)
-        with torch.amp.autocast('cuda', enabled=False):
-            shared = self.gate_shared(x).float()
-
+        with torch.cuda.amp.autocast(enabled=True):
+            shared = self.gate_shared(x)
         d_logits = self.gate_digit(shared)
         u_logits = self.gate_upper(shared)
         l_logits = self.gate_lower(shared)
-
-        # apply temperature (tensor)
         temp = torch.clamp(self.gate_temp, min=0.1, max=10.0)
-        if temp != 1.0:
-            d_logits = d_logits / temp
-            u_logits = u_logits / temp
-            l_logits = l_logits / temp
-
-        # concatenate in the same ordering as forward expects (digit, upper, lower)
-        return torch.cat([d_logits, u_logits, l_logits], dim=1)
-
-    def debug_stats(self, x):
-        """Return small diagnostic tensors (no-grad). Cheap version — only digit group)."""
-        with torch.no_grad():
-            shared = self.gate_shared(x).float()
-            gate_logits_d = self.gate_digit(shared)
-
-            # run digit experts only
-            digit_outputs = self._run_experts(self.digit_experts, x)
-            digit_unknown_probs = F.softmax(digit_outputs, dim=-1)[..., -1]
-
-            d_logits_adj = gate_logits_d - digit_unknown_probs * torch.clamp(self.unknown_scale, min=0.0)
-            kd = min(self.k, self.num_digit_experts)
-            d_topv, d_idx = d_logits_adj.topk(k=kd, dim=1)
-            neg_inf = -1e9
-            d_masked_logits = torch.full_like(d_logits_adj, neg_inf)
-            d_masked_logits.scatter_(1, d_idx, d_topv)
-            d_norm = F.softmax(d_masked_logits, dim=1)
-
-            return {
-                "gate_logits_d": gate_logits_d,
-                "d_norm": d_norm,
-                "digit_unknown_probs": digit_unknown_probs,
-                "digit_outputs_min": digit_outputs.min(dim=-1).values,
-            }
+        return torch.cat([d_logits / temp, u_logits / temp, l_logits / temp], dim=1)
 

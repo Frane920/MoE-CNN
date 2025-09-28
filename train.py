@@ -11,7 +11,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from lion_pytorch import Lion
-from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torchvision import datasets
@@ -329,7 +329,8 @@ class Trainer:
         if self.args.device.type == 'cuda':
             self.optimize_memory()
 
-        self.swa_start = 100  # Start SWA after 100 epochs
+        # Replace hardcoded value
+        self.swa_start = args.swa_start if hasattr(args, 'swa_start') else int(args.epochs * 0.75)
         self.swa_scheduler = None
         self.swa_model = None
 
@@ -377,10 +378,9 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         it = 0
 
-        # Penalty warmup and monitoring
-        # safer penalty warmup (linear to 1.0 over warmup_epochs)
         warmup_epochs = getattr(self.args, "warmup_epochs", 5)
-        penalty_weight = float(self.args.penalty_weight) * min(1.0, float(epoch) / max(1.0, warmup_epochs))
+        frac = min(1.0, float(epoch) / max(1.0, warmup_epochs))
+        penalty_weight = float(self.args.penalty_weight) * (0.5 * (1 - math.cos(math.pi * frac)))
 
         penalty_debug = []
         total_experts = (
@@ -517,9 +517,7 @@ class Trainer:
             # Expert usage monitoring (every 50 steps)
             if it % 50 == 0:
                 with torch.no_grad():
-                    # Simple gate monitoring - get top expert indices
-                    with torch.no_grad():
-                        gate_output = self.model.gate(x)
+                    gate_output = self.model.gate(x)
                     top_experts = gate_output.argmax(dim=1)
                     for idx in top_experts:
                         expert_usage[idx] += 1
@@ -597,8 +595,8 @@ class Trainer:
                 expert_info = ""
                 if it % 100 == 0 and expert_usage.sum() > 0:
                     expert_pct = (expert_usage / expert_usage.sum() * 100).cpu().numpy()
-                    expert_info = f" | Experts: {expert_pct[0]:.1f}%"
-                    expert_usage.zero_()  # Reset for next window
+                    expert_info = f" | Experts: {', '.join([f'{p:.1f}%' for p in expert_pct])}"
+                    expert_usage.zero_()
 
                 pbar.set_postfix(
                     loss=f"{avg_loss:.4f}",

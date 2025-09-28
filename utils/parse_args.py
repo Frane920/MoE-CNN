@@ -40,7 +40,7 @@ def parse_args():
     p.add_argument('--penalty_weight', type=float, default=0.2)
     p.add_argument('--gradient_checkpointing', action='store_true', default=False)
     p.add_argument('--no_prefetch', action='store_true', default=False)
-
+    p.add_argument('--swa_start', type=int, default=None, help='Epoch to start SWA (defaults to 75% of total epochs)')
     p.add_argument('--k_per_specialization', type=int, default=2, help='Number of experts to select per specialization')
     p.add_argument('--use_specialized_moe', action='store_true', default=True,
                    help='Use specialized MoE with unknown class filtering')
