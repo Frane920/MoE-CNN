@@ -936,7 +936,7 @@ def main():
     trainer.warmup_model()
 
     # Training metrics tracking
-    max_patience = 15
+    max_patience = 25
     patience = 0
     best_acc = best_acc  # This might be loaded from checkpoint
 
