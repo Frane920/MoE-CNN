@@ -936,7 +936,7 @@ def main():
     trainer.warmup_model()
 
     # Training metrics tracking
-    max_patience = 25
+    max_patience = 30
     patience = 0
     best_acc = best_acc  # This might be loaded from checkpoint
 
@@ -969,7 +969,7 @@ def main():
             else:
                 patience += 1
                 if args.rank0:
-                    print(f"⏳ No improvement for {patience} epochs (best: {best_acc:.3f}%)")
+                    print(f"No improvement for {patience} epochs (best: {best_acc:.3f}%)")
 
             if patience >= max_patience:
                 if args.rank0:
