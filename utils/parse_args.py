@@ -6,7 +6,7 @@ def parse_args():
     p.add_argument('--data-dir', type=str, default='./data')
     p.add_argument('--per_gpu_batch', type=int, default=512)
     p.add_argument('--epochs', type=int, default=125)
-    p.add_argument('--lr', type=float, default=3e-5)
+    p.add_argument('--lr', type=float, default=2e-5)
     p.add_argument('--accum', type=int, default=4)
     p.add_argument('--num_workers', type=int, default=8)
     p.add_argument('--save', type=str, default='model.pt')
